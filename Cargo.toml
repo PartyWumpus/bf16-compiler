@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-#clap = "4.5.40"
+clap = { version = "4.5.40", features = ["derive"] }
 inkwell = { version = "0.6.0", features = ["llvm18-1"] }
 sdl2 = "0.37.0"
 thiserror = "2.0.12"

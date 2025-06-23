@@ -1,3 +1,4 @@
+use clap::Parser;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -16,6 +17,7 @@ use sdl2::video::Window;
 use std::cell::RefCell;
 use std::error::Error;
 use std::process::exit;
+use std::sync::LazyLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{fs, mem};
@@ -24,24 +26,56 @@ const WINDOW_SIZE: u32 = 512;
 const PIXEL_SCALE: u32 = WINDOW_SIZE / 16;
 
 thread_local! {
-static PREV_TIME: RefCell<Instant> = RefCell::new(Instant::now());
-static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
-static SDL_CONTEXT: RefCell<Sdl> = RefCell::new(sdl2::init().unwrap());
-static SDL_CANVAS: RefCell<Canvas<Window>> = {
-    let canvas = SDL_CONTEXT.with(|sdl_context| {
-        let sdl_context = sdl_context.borrow();
-        let video_subsystem = sdl_context.video().unwrap();
+    static PREV_TIME: RefCell<Instant> = RefCell::new(Instant::now());
+    static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
+    static SDL_CONTEXT: RefCell<Sdl> = RefCell::new(sdl2::init().unwrap());
+    static SDL_CANVAS: RefCell<Canvas<Window>> = {
+        let canvas = SDL_CONTEXT.with(|sdl_context| {
+            let sdl_context = sdl_context.borrow();
+            let video_subsystem = sdl_context.video().unwrap();
 
-    let window = video_subsystem.window("rust-sdl2 demo", WINDOW_SIZE, WINDOW_SIZE)
+        let window = video_subsystem.window("rust-sdl2 demo", WINDOW_SIZE, WINDOW_SIZE)
         .position_centered()
         .build()
         .unwrap();
 
-    window.into_canvas().build().unwrap()
-    });
+        window.into_canvas().build().unwrap()
+        });
 
-    RefCell::new(canvas)
+        RefCell::new(canvas)
+    };
 }
+
+static ARGS: LazyLock<Args> = LazyLock::new(|| Args::parse());
+
+fn to_opt_level(s: &str) -> Result<OptimizationLevel, String> {
+    let opt_level: usize = s.parse().map_err(|_| format!("`{s}` isn't a number"))?;
+    Ok(match opt_level {
+        0 => OptimizationLevel::None,
+        1 => OptimizationLevel::Less,
+        2 => OptimizationLevel::Default,
+        3 => OptimizationLevel::Aggressive,
+        4.. => return Err("Opt level not in range 0-3".to_owned()),
+    })
+}
+
+#[derive(Parser, Debug)]
+#[command(about="An LLVM-based brainfuck compiler", long_about = None)]
+struct Args {
+    /// File to compile
+    filename: String,
+
+    /// Optimization level, from 0-3
+    #[arg(value_enum, long, short='O',short_alias='o', default_value = "2", value_parser=to_opt_level)]
+    opt_level: OptimizationLevel,
+
+    /// Outputs LLVM IR after each function is generated
+    #[arg(short, long)]
+    print_llvm_ir: bool,
+
+    /// Display is interpreted
+    #[arg(short, long)]
+    grayscale: bool,
 }
 
 /// Calling this is innately `unsafe` because there's no guarantee it doesn't
@@ -98,15 +132,27 @@ impl<'ctx> CodeGen<'ctx> {
             put_fn,
             get_fn,
         };
+        let mut prev: Option<char> = None;
+        let mut count = 0;
         for op in code.chars() {
-            // llvm would compile this marginally faster if i simply collected duplicates here
-            // however
-            // llvm can deal with it
+            if prev == Some(op) {
+                count += 1
+            } else {
+                match prev {
+                    Some('>') => self.emit_inc_ptr(&pointers, count)?,
+                    Some('<') => self.emit_dec_ptr(&pointers, count)?,
+                    Some('+') => self.emit_inc_data(&pointers, count)?,
+                    Some('-') => self.emit_dec_data(&pointers, count)?,
+                    _ => (),
+                }
+                if matches!(op, '>' | '<' | '+' | '-') {
+                    prev = Some(op);
+                    count = 1;
+                } else {
+                    prev = None;
+                };
+            };
             match op {
-                '>' => self.emit_inc_ptr(&pointers)?,
-                '<' => self.emit_dec_ptr(&pointers)?,
-                '+' => self.emit_inc_data(&pointers)?,
-                '-' => self.emit_dec_data(&pointers)?,
                 '[' => self.emit_loop_begin(function, &pointers)?,
                 ']' => self.emit_loop_end()?,
                 '.' => self.emit_call_put_fn(&pointers)?,
@@ -117,12 +163,14 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.builder.build_return(None).unwrap();
 
-        println!("{}", self.module.print_to_string());
+        if ARGS.print_llvm_ir {
+            println!("{}", self.module.print_to_string().to_string());
+        };
 
         unsafe { Ok(self.execution_engine.get_function("init")?) }
     }
 
-    fn emit_inc_ptr(&self, pointers: &Pointers<'ctx>) -> Result<(), Box<dyn Error>> {
+    fn emit_inc_ptr(&self, pointers: &Pointers<'ctx>, count: u64) -> Result<(), Box<dyn Error>> {
         let i16_type = self.context.i16_type();
         let pos: IntValue = self
             .builder
@@ -131,12 +179,12 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
         let pos = self
             .builder
-            .build_int_add(pos, i16_type.const_int(1, false), "pos")?;
+            .build_int_add(pos, i16_type.const_int(count, false), "pos")?;
         self.builder.build_store(pointers.position_ptr, pos)?;
         Ok(())
     }
 
-    fn emit_dec_ptr(&self, pointers: &Pointers<'ctx>) -> Result<(), Box<dyn Error>> {
+    fn emit_dec_ptr(&self, pointers: &Pointers<'ctx>, count: u64) -> Result<(), Box<dyn Error>> {
         let i16_type = self.context.i16_type();
         let pos: IntValue = self
             .builder
@@ -145,12 +193,12 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
         let pos = self
             .builder
-            .build_int_sub(pos, i16_type.const_int(1, false), "pos")?;
+            .build_int_sub(pos, i16_type.const_int(count, false), "pos")?;
         self.builder.build_store(pointers.position_ptr, pos)?;
         Ok(())
     }
 
-    fn emit_inc_data(&self, pointers: &Pointers<'ctx>) -> Result<(), Box<dyn Error>> {
+    fn emit_inc_data(&self, pointers: &Pointers<'ctx>, count: u64) -> Result<(), Box<dyn Error>> {
         let i8_type = self.context.i8_type();
 
         let val_ptr = self.emit_get_val_ptr(pointers)?;
@@ -161,12 +209,12 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
         let val = self
             .builder
-            .build_int_add(val, i8_type.const_int(1, false), "val")?;
+            .build_int_add(val, i8_type.const_int(count, false), "val")?;
         self.builder.build_store(val_ptr, val)?;
         Ok(())
     }
 
-    fn emit_dec_data(&self, pointers: &Pointers<'ctx>) -> Result<(), Box<dyn Error>> {
+    fn emit_dec_data(&self, pointers: &Pointers<'ctx>, count: u64) -> Result<(), Box<dyn Error>> {
         let i8_type = self.context.i8_type();
         let val_ptr = self.emit_get_val_ptr(pointers)?;
         let val: IntValue = self
@@ -176,7 +224,7 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
         let val = self
             .builder
-            .build_int_sub(val, i8_type.const_int(1, false), "val")?;
+            .build_int_sub(val, i8_type.const_int(count, false), "val")?;
         self.builder.build_store(val_ptr, val)?;
         Ok(())
     }
@@ -293,15 +341,21 @@ extern "C" fn put(_audio_pitch: u8, data_ptr: *mut [u8; 30000]) {
             for x in 0..=15 {
                 let pixel = unsafe { (*data_ptr)[x + y * 16] };
 
-                // read u8 as RGB332
-                let r: u8 = (pixel & 0xE0) >> 5; // Extract top 3 bits for red
-                let g: u8 = (pixel & 0x1C) >> 2; // Extract middle 3 bits for green
-                let b: u8 = pixel & 0x03; // Extract bottom 2 bits for blue
+                let (r, g, b) = if ARGS.grayscale {
+                    (pixel, pixel, pixel)
+                } else {
+                    // read u8 as RGB332
+                    let r: u8 = (pixel & 0xE0) >> 5; // Extract top 3 bits for red
+                    let g: u8 = (pixel & 0x1C) >> 2; // Extract middle 3 bits for green
+                    let b: u8 = pixel & 0x03; // Extract bottom 2 bits for blue
 
-                // Scale the values to full 8-bit range
-                let r: u8 = ((u16::from(r) * 255) / 7) as u8;
-                let g: u8 = ((u16::from(g) * 255) / 7) as u8;
-                let b: u8 = ((u16::from(b) * 255) / 3) as u8;
+                    // Scale the values to full 8-bit range
+                    let r: u8 = ((u16::from(r) * 255) / 7) as u8;
+                    let g: u8 = ((u16::from(g) * 255) / 7) as u8;
+                    let b: u8 = ((u16::from(b) * 255) / 3) as u8;
+                    (r, g, b)
+                };
+
                 canvas.set_draw_color(Color::RGB(r, g, b));
                 canvas
                     .fill_rect(Rect::new(
@@ -415,7 +469,7 @@ extern "C" fn get() -> u8 {
 fn main() -> Result<(), Box<dyn Error>> {
     let context = Context::create();
     let module = context.create_module("brainfuck");
-    let execution_engine = module.create_jit_execution_engine(OptimizationLevel::Aggressive)?;
+    let execution_engine = module.create_jit_execution_engine(ARGS.opt_level)?;
     let mut codegen = CodeGen {
         context: &context,
         module,
@@ -427,7 +481,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut data_position: u16 = 0;
     let mut data = Box::new([0; 30000]);
 
-    let init = codegen.compile_full(&fs::read_to_string("file.b")?)?;
+    let init = codegen.compile_full(&fs::read_to_string(&ARGS.filename)?)?;
     let data_pos_ptr = &raw mut data_position;
     let data_ptr = &raw mut *data;
 
