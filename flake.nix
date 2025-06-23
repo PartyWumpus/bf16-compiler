@@ -23,16 +23,15 @@
 				devShell = mkShell rec {
 					packages = [
 						rust-bin.stable.latest.default
-
+            #(rust-bin.selectLatestNightlyWith (toolchain:
+            #  toolchain.default.override {
+            #    extensions = [ "miri" "rust-src" ];
+            #}))
             llvm_18
             libffi
             libxml2
-            linuxPackages_latest.perf
             SDL2
 					];
 				};
-        shellHook = ''
-          export RUSTFLAGS='-C target-cpu=native'
-        '';
 			});
 }
