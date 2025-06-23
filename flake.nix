@@ -28,6 +28,7 @@
             libffi
             libxml2
             linuxPackages_latest.perf
+            SDL2
 					];
 				};
         shellHook = ''

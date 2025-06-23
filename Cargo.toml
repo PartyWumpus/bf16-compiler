@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = "4.5.40"
+#clap = "4.5.40"
 inkwell = { version = "0.6.0", features = ["llvm18-1"] }
-libc = "0.2.174"
+sdl2 = "0.37.0"
 thiserror = "2.0.12"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
